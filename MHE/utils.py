@@ -10,21 +10,10 @@ class MHE:
             g,
             dt:float,
             horizon:int,
-            P:np.array, 
             Q:np.array,
             R:np.array):
 
         self.horizon = horizon
-
-        # State
-        self.x = ca.MX.sym('x', 2, horizon)
-        self.x0 = ca.MX.sym('x0', 2, 1)
-        self.x_pred = ca.MX.sym('x_pred', 2, horizon)
-
-        # Measurements
-        # self.y = ca.SX.sym('y', 2, horizon)
-
-        
 
         # Dynamical system 
         self.f = f
@@ -32,52 +21,33 @@ class MHE:
         # Measurement function 
         self.g = g
 
-        # Define the ODE function
-        # ode = {'x': x, 'p': ca.vertcat(u, d), 'ode': xdot}
-        
-
-        # pred
-        print()
-
-        # Process matrix
-        self.P = ca.SX.sym('P', 2, 2)
-
         # State matrix
-        self.Q = ca.SX.sym('Q', 2, 2)
+        self.Q = Q
+        self.Q_inv = ca.inv(Q)
 
         # Measurement matrix
-        self.R = ca.SX.sym('R', 2, 2)
-
-        self.w = ca.SX.sym('w', 2, horizon)
-
-        # Define dynamical system
-        # self.states = ode['x']
+        self.R = R 
+        self.R_inv = ca.inv(R)
 
         self.dt = dt  
-
-        self.u = ca.MX.sym('u', 2, horizon)
-        self.d = ca.MX.sym('d', 2, horizon)
-
-        # Build an integrator (using the cvodes method)
-        # Control
-        self.u_dyn = ca.MX.sym('u_dyn', 2, 1)
-        self.d_dyn = ca.MX.sym('d_dyn', 2, 1)
-        self.x_dyn = ca.MX.sym('x_dyn', 2, 1)
-       
-        self.one_step_integrator = self.get_symbolic_integrator()
 
         self.df__dx = self.get_symbolic_gradient_df__dx()
         self.df__dw = self.get_symbolic_gradient_df__dw()
         self.dg__dx = self.get_symbolic_gradient_dg__dx()
+        
+        self.one_step_integrator = self.get_symbolic_integrator()
+        self.integrator = self.get_symbolic_integration_of_f()
 
         self.arrival_cost = self.get_symbolic_arrival_cost()
         self.stage_cost = self.get_symbolic_stage_cost()
 
-        x = np.ones((2, 1))*2; u = np.ones((2, 1)); d = np.ones((2, 1))
-        self.integrator = self.get_symbolic_integration_of_f()
-        
-        self.loss_function = self.get_symbolic_loss_function()
+        x = ca.DM(np.ones((2, self.horizon)))
+        x_meas = ca.DM(np.zeros((2, self.horizon)))
+        w = ca.DM(np.zeros((2, self.horizon)))
+        pi_inv = ca.DM(np.ones((2, 2)))
+        q_inv = ca.DM(np.ones((2, 2)))
 
+        self.loss_function = self.get_symbolic_loss_function()
 
     def update_covariance_matrix(
             self, x, u, d,
@@ -106,6 +76,8 @@ class MHE:
             Updated covariance matrix.
         """
 
+        assert P.shape[0] == P.shape[1]
+
         A0 = self.df__dx(x, u, d)
         G0 = self.df__dw(x, u, d)
         C0 = self.dg__dx(x, u, d)
@@ -133,16 +105,16 @@ class MHE:
             P_inv = covariance matrix inverse (CasADi SX)
             """
             delta_x = x - x_bar
-            return (delta_x.T@P_inv)@delta_x
+            return ca.mtimes(delta_x.T, ca.mtimes(P_inv, delta_x))
         
         x0 = ca.MX.sym('x0', 2, 1)
-        x0_bar = ca.MX.sym('x0', 2, 1)
+        x0_bar = ca.MX.sym('x0_bar', 2, 1)
         P = ca.MX.sym('P', 2, 2)
         return ca.Function('arrival_cost', [x0, x0_bar, P], [arrival_cost(x0, x0_bar, P)])
 
     def get_symbolic_stage_cost(self):
 
-        def stage_cost(x, x_meas, w, P_inv, Q_inv):
+        def stage_cost(x, x_meas, w, Q_inv, R_inv):
             """
             x : current state estimate
             x_meas : a priori state estimate
@@ -153,22 +125,20 @@ class MHE:
             delta_x = x - x_meas
             cum_sum = 0
             for i in range(delta_x.shape[0]):
-                cum_sum += (delta_x[:, i].T@P_inv)@delta_x[:, i]
-            
+                cum_sum += ca.mtimes(delta_x[:, i].T, ca.mtimes(R_inv, delta_x[:, i]))
             return cum_sum
+        
         x = ca.MX.sym('x0', 2, self.horizon)
-        x_bar = ca.MX.sym('x0', 2, self.horizon)
+        x_meas = ca.MX.sym('x0_bar', 2, self.horizon)
         w = ca.MX.sym('d', 2, self.horizon) 
-        P = ca.MX.sym('P', 2, 2)
-        Q = ca.MX.sym('P', 2, 2)
-        return ca.Function('stage_cost', [x, x_bar, w, P, Q], [stage_cost(x, x_bar, w, P, Q)])
+        R_inv = ca.MX.sym('P', 2, 2)
+        Q_inv = ca.MX.sym('Q', 2, 2)
+        return ca.Function('stage_cost', [x, x_meas, w, Q_inv, R_inv], [stage_cost(x, x_meas, w, Q_inv, R_inv)])
     
     def get_symbolic_gradient_df__dx(self):
         u_in = ca.MX.sym('u_in', 2, 1)
         d_in = ca.MX.sym('d_in', 2, 1)
         x_in = ca.MX.sym('x_in', 2, 1)
-        # jacobian_x = ca.diag(ca.jacobian(self.f(self.x[:, 0], self.u[:, 0], self.d[:, 0]), self.x[:, 0]))
-        # return ca.Function('grad_df_dx', [self.x[:, 0], self.u[:, 0], self.d[:, 0]], [jacobian_x])
         jacobian_x = ca.diag(ca.jacobian(self.f(x_in, u_in, d_in), x_in))
         return ca.Function('grad_df_dx', [x_in, u_in, d_in], [jacobian_x])
     
@@ -176,8 +146,6 @@ class MHE:
         u_in = ca.MX.sym('u_in', 2, 1)
         d_in = ca.MX.sym('d_in', 2, 1)
         x_in = ca.MX.sym('x_in', 2, 1)
-        # jacobian_x = ca.diag(ca.jacobian(self.f(self.x[:, 0], self.u[:, 0], self.d[:, 0]), self.d[:, 0]))
-        # return ca.Function('grad_df_dw', [self.x[:, 0], self.u[:, 0], self.d[:, 0]], [jacobian_x])
         jacobian_d = ca.diag(ca.jacobian(self.f(x_in, u_in, d_in), d_in))
         return ca.Function('grad_df_dw', [x_in, u_in, d_in], [jacobian_d])
     
@@ -185,20 +153,22 @@ class MHE:
         u_in = ca.MX.sym('u_in', 2, 1)
         d_in = ca.MX.sym('d_in', 2, 1)
         x_in = ca.MX.sym('x_in', 2, 1)
-        # jacobian_x = ca.diag(ca.jacobian(self.g(self.x[:, 0], self.u[:, 0], self.d[:, 0]), self.x[:, 0]))
-        # return ca.Function('grad_dg_dx', [self.x[:, 0], self.u[:, 0], self.d[:, 0]], [jacobian_x])
         jacobian_x = ca.diag(ca.jacobian(self.g(x_in, u_in, d_in), x_in))
         return ca.Function('grad_dg_dx', [x_in, u_in, d_in], [jacobian_x])
     
     def get_symbolic_integrator(self):
-        u_in = ca.MX.sym('u_in', 2, 1)
-        d_in = ca.MX.sym('d_in', 2, 1)
+        u_in = ca.DM(2, 1) #MX.sym('u_in', 2, 1)
+        d_in = ca.DM(2, 1) #MX.sym('d_in', 2, 1)
         x_in = ca.MX.sym('x_in', 2, 1)
-        dae = {'x': x_in, 'p': ca.vertcat(u_in, d_in), 'ode': self.f(x_in, u_in, d_in)}
-        opts = {'tf': self.dt}
-        one_step_integrator = ca.integrator('integrator', 'cvodes', dae, opts)
-        res = one_step_integrator(x0=x_in, p=ca.vertcat(u_in, d_in))
-        x_next = res['xf']
+        # dae = {'x': x_in, 'p': ca.vertcat(u_in, d_in), 'ode': self.f(x_in, u_in, d_in)}
+        # opts = {'tf': self.dt}
+        # one_step_integrator = ca.integrator('integrator', 'cvodes', dae, opts)
+        # res = one_step_integrator(x0=x_in, p=ca.vertcat(u_in, d_in))
+        # x_next = res['xf']
+        f = self.f(x_in, u_in, d_in)  # f should return the derivative dx/dt
+
+        # Euler integration step
+        x_next = x_in + f * self.dt  # Update state based on the Euler method
         return ca.Function('f_next_state', [x_in, u_in, d_in], [x_next])
 
     def get_symbolic_integration_of_f(self):
@@ -207,8 +177,8 @@ class MHE:
             x = x0
             x_out = ca.MX(2, self.horizon)
             for i in range(self.horizon):
+                x_out[:, i] = self.g(x, u[:, i], d[:, i])
                 x = self.one_step_integrator(x, u[:, i], d[:, i])
-                x_out[:, i] = x
             return x_out
         
         x_in = ca.MX.sym('x_in', 2, 1)
@@ -219,9 +189,9 @@ class MHE:
     
     def get_symbolic_loss_function(self):
 
-        def loss_function(x_est, x_bar, x_meas, u, d, P_inv, Q_inv):
+        def loss_function(x_est, x_bar, x_meas, u, d, P_inv, Q_inv, R_inv):
             x_pred = self.integrator(x_est, u, d)
-            return self.arrival_cost(x_est, x_bar, P_inv) + self.stage_cost(x_pred, x_meas, d, P_inv, Q_inv)
+            return self.arrival_cost(x_est, x_bar, P_inv) + self.stage_cost(x_pred, x_meas, d, Q_inv, R_inv)
         
         x_est = ca.MX.sym('x_est', 2, 1)
         x_bar = ca.MX.sym('x_bar', 2, 1)
@@ -230,147 +200,105 @@ class MHE:
         d_in = ca.MX.sym('d_in', 2, self.horizon)
         P_inv = ca.MX.sym('P_inv', 2, 2)
         Q_inv = ca.MX.sym('Q_inv', 2, 2)
+        R_inv = ca.MX.sym('Q_inv', 2, 2)
 
-        return ca.Function('f_integration', [x_est, x_bar, x_meas, u_in, d_in, P_inv, Q_inv], [loss_function(x_est, x_bar, x_meas, u_in, d_in, P_inv, Q_inv)])
+        return ca.Function('loss_function', [x_est, x_bar, x_meas, u_in, d_in, P_inv, Q_inv, R_inv], [loss_function(x_est, x_bar, x_meas, u_in, d_in, P_inv, Q_inv, R_inv)])
     
-    def optimize(self, x_bar, x_meas, u_in, d_in, P_inv, Q_inv):
+    def optimize(self, x_bar, x_meas, u_in, d_in, P):
 
-        # Define the optimization problem
+        P_inv = ca.inv(P)
+
         x_est = ca.MX.sym('x_est', 2, 1)
-        # x_bar = ca.MX.sym('x_bar', 2, 1)
-        # x_meas = ca.MX.sym('x_meas', 2, self.horizon)
-        # u_in = ca.MX.sym('u_in', 2, self.horizon)
-        # d_in = ca.MX.sym('d_in', 2, self.horizon)
-        # P_inv = ca.MX.sym('P_inv', 2, 2)
-        # Q_inv = ca.MX.sym('Q_inv', 2, 2)
-
+    
         # Define the NLP problem
         nlp = {
             'x': x_est,
-            'f': self.loss_function(x_est, x_bar, x_meas, u_in, d_in, P_inv, Q_inv),
+            'f': self.loss_function(x_est, x_bar, x_meas, u_in, d_in, P_inv, self.Q_inv, self.R_inv),
             'g': []  # Add constraints here if needed
         }
 
-        # Set IPOPT options
-        opts = {
-            'ipopt.print_level': 0,
-            'print_time': False,
-            'ipopt.tol': 1e-8
-        }
-
         # Create the solver instance
+
+        opts={}
+        opts["ipopt"] = {"max_iter": 1, "tol": 1e-10, "print_level": 0}
         solver = ca.nlpsol('solver', 'ipopt', nlp, opts)
 
-        # Define initial guess and bounds
-        # x0 = [0.5, 0.5]  # Initial guess
         lbx = [-ca.inf, -ca.inf]  # Lower bounds on x
         ubx = [ca.inf, ca.inf]  # Upper bounds on x
 
         # Solve the problem
-        sol = solver(x0=x0, lbx=lbx, ubx=ubx)
+        sol = solver(x0=x_bar, lbx=lbx, ubx=ubx)
+        # if solver.stats()['success']:
+        x_opt = sol['x'].full()
+        # else:
+            # print("Optimization failed!")
+        # # Extract the solution
+        # x_opt = sol['x'].full()
+        # print(f"Optimal solution: x_est = {x_opt}")
 
-        # Extract the solution
-        x_est_opt = sol['x'].full().flatten()
-        print(f"Optimal solution: x_est = {x_est_opt}")
+        # Predict next state
+        x_opt_next = self.one_step_integrator(x_opt, u[:, 0], d[:, 0])
 
-        return x_est_opt
+        # Update covariance matrix
+        P_est = self.update_covariance_matrix(x_opt, u[:, 0], d[:, 0], P, self.Q, self.R)
+        print(np.diag(P_est))
+        return x_opt, x_opt_next, P_est, sol['f']
 
 if __name__ == '__main__':
 
     # Define time
     T = 10.0    # Total time for simulation (seconds)
-    dt = 0.01   # Time step (seconds)
+    dt = 0.02   # Time step (seconds)
     N = int(T / dt)  # Number of time steps
 
     # Define the system dynamics function
     def f(x, u, d):
-        x0 = 1 * x[0] + 1 * u[0] + d[0]
-        x1 = 1 * x[1] + 0 * u[1] + 0 * d[1]
+        x0 = -0.1 * x[0] + 0 * u[0] + 0 * d[0]
+        x1 = -0.2 * x[1] + x[0] + 0 * u[1] + 0 * d[1]
         return ca.vertcat(x0, x1)
     
     def g(x, u ,d):
-        x0 = 1 * x[0] 
-        x1 = 1 * x[1]
+        x0 = 1 * x[0]
+        x1 = 0 * x[1]
         return ca.vertcat(x0, x1)
+    
+    # Generate measurements
+    x0 = np.ones((2, 1))
+    u = np.zeros((2, N))
+    d = np.zeros((2, N))
+    x_meas = []
+    x = x0
+    for i in range(N):
+        x_meas.append(x + np.random.randn(2, 1) * 0.1)
+        x = f(x, u[:, i], d[:, i]) * dt + x 
+    x_meas = np.asarray(x_meas).T[0]
 
-    # Initial conditions
-    # x0 = 1.0  # Initial position (displaced by 1 unit)
-    # v0 = 0.0  # Initial velocity
-    # state_initial = np.array([x0, v0])
+    sigma_p = 1
+    P0 = np.diag((sigma_p**2, sigma_p**2))
 
-    # # Simulation results storage
-    # trajectory = np.zeros((N, 2))  # To store [x, v] over time
-    # time = np.linspace(0, T, N)    # Time vector
+    sigma_q = 1
+    Q = np.diag((sigma_q**2, sigma_q**2))
 
-    # # Run the simulation
-    # state = state_initial
-    # for i in range(N):
-    #     trajectory[i, :] = state + np.random.randn(2)*0.1
-    #     result = integrator(x0=state)
-    #     state = result['xf'].full().flatten()  # Extract the final state of this step
-
-    initial_P = np.diag((0.1, 0.1))
-    initial_Q = np.diag((0.1, 0.1))
-    initial_R = np.diag((0.1, 0.1))
+    sigma_r = 0.05
+    R = np.diag((sigma_r**2, sigma_r**2))
 
     # MHE loop
-    past_horizon = 10
+    past_horizon = 5
 
-    mhe = MHE(f, g, dt, past_horizon, initial_P, initial_Q, initial_R)
+    mhe = MHE(f, g, dt, past_horizon, Q, R)
 
-    x0 = np.ones((2, 1))
-    x_bar = x0 + 10
-    u = np.ones((2, 10))
-    d = np.zeros((2, 10))
+    x_meas = ca.DM(x_meas)
 
-    P_inv  = np.diag([1/10, 1/10])
-    Q_inv = np.diag([1/10, 1/10])
+    x_bar = np.asarray([1, 1])
+    x_opt_list = []
+    sol_f_list = []
+    for i in range(N-past_horizon):
+        xopt, x_bar, P0, sol_f = mhe.optimize(x_bar, x_meas[:, i:i+past_horizon], u[:, i:i+past_horizon], d[:, i:i+past_horizon], P0)
+        x_opt_list.append(xopt)
+        sol_f_list.append(sol_f)
+    print()
 
-    x_meas = mhe.integrator(x0, u, d)
-    
-    mhe.optimize(x_bar, x_meas, u, d, P_inv, Q_inv)
-        
+    # plt.plot(np.asarray(res)[:, 0])
+    plt.plot(np.asarray(x_meas)[0])
 
-
-        
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-    # # Plot the results
-    # plt.figure(figsize=(10, 5))
-    # plt.subplot(2, 1, 1)
-    # plt.plot(time, trajectory[:, 0], label='Position (x)')
-    # plt.title('Spring-Mass-Damper System Simulation')
-    # plt.xlabel('Time [s]')
-    # plt.ylabel('Position [m]')
-    # plt.legend()
-    # plt.grid()
-
-    # plt.subplot(2, 1, 2)
-    # plt.plot(time, trajectory[:, 1], label='Velocity (v)', color='orange')
-    # plt.xlabel('Time [s]')
-    # plt.ylabel('Velocity [m/s]')
-    # plt.legend()
-    # plt.grid()
-
-    # plt.tight_layout()
-    # plt.show()
+    print()
